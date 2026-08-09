@@ -89,7 +89,7 @@ OWNER_FILE = DATA_DIR / "owner_id.txt"
 
 router = Router()
 
-BUILD_VERSION = "v13.2-instagram-wait-ready"
+BUILD_VERSION = "v14-full-autopilot"
 
 TARIFF_RE = re.compile(
     r"тариф\s*:\s*([\d\s]+)\s*(?:руб(?:\.|лей)?|₽)?\s*(?:/|в)?\s*мес",
@@ -122,6 +122,12 @@ DEFAULT_STATE = {
     "last_approved": None,
     "last_instagram_media_id": None,
     "last_instagram_error": None,
+    "ig_auto_enabled": False,
+    "ig_auto_top5_time": "10:00",
+    "ig_auto_day_time": "19:00",
+    "ig_auto_last_top5_date": None,
+    "ig_auto_last_day_date": None,
+    "ig_auto_history": [],
 }
 
 
@@ -1706,6 +1712,205 @@ def instagram_keyboard() -> InlineKeyboardMarkup:
 
 
 
+
+# =========================
+# Full Instagram autopilot
+# =========================
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    try:
+        hh, mm = value.strip().split(":", 1)
+        hour, minute = int(hh), int(mm)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        return hour, minute
+    except Exception as exc:
+        raise ValueError("Время должно быть в формате ЧЧ:ММ, например 10:00") from exc
+
+
+def _format_auto_status(state: dict) -> str:
+    enabled = bool(state.get("ig_auto_enabled"))
+    return (
+        "📸 АВТОПУБЛИКАЦИЯ INSTAGRAM\n\n"
+        f"Статус: {'ВКЛЮЧЕНА ✅' if enabled else 'ВЫКЛЮЧЕНА ⛔️'}\n"
+        f"🔥 ТОП-5: {state.get('ig_auto_top5_time', '10:00')} (Москва)\n"
+        f"⭐ Номер дня: {state.get('ig_auto_day_time', '19:00')} (Москва)\n\n"
+        "Что делает бот автоматически:\n"
+        "API Безлимита → отбор → картинка → Instagram → история.\n\n"
+        "Номера, которые уже публиковались, повторно не выбираются."
+    )
+
+
+def auto_publish_keyboard(state: dict) -> InlineKeyboardMarkup:
+    enabled = bool(state.get("ig_auto_enabled"))
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⛔️ Выключить" if enabled else "✅ Включить",
+                    callback_data="igauto:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(text="🔥 ТОП-5 10:00", callback_data="igauto:top5:10:00"),
+                InlineKeyboardButton(text="🔥 ТОП-5 12:00", callback_data="igauto:top5:12:00"),
+            ],
+            [
+                InlineKeyboardButton(text="⭐ День 18:00", callback_data="igauto:day:18:00"),
+                InlineKeyboardButton(text="⭐ День 20:00", callback_data="igauto:day:20:00"),
+            ],
+            [
+                InlineKeyboardButton(text="🧪 Тест ТОП-5 сейчас", callback_data="igauto:test:top5"),
+                InlineKeyboardButton(text="🧪 Тест Номер дня", callback_data="igauto:test:day"),
+            ],
+        ]
+    )
+
+
+async def autopublish_mode(
+    bot: Bot,
+    chat_id: int,
+    mode: str,
+    *,
+    notify: bool = True,
+) -> str:
+    if not instagram_configured():
+        raise InstagramPublishError(
+            "Instagram API не готов. Проверь /igstatus."
+        )
+
+    catalog = await get_live_catalog(bot, chat_id, force=True)
+    if not catalog:
+        raise RuntimeError("Не удалось получить свежий каталог Безлимита.")
+
+    state = load_state()
+    used = set(state.get("used", []))
+    limit = 1 if mode == "day" else 5
+    items = select_mode(catalog, mode, used, limit=limit)
+    if not items:
+        # Если всё уже использовано, очищаем только историю used для выбора
+        # и повторяем на свежем каталоге. Это защита от полной остановки автопилота.
+        used = set()
+        items = select_mode(catalog, mode, used, limit=limit)
+
+    if not items:
+        raise RuntimeError("API не дал подходящих номеров для публикации.")
+
+    title, subtitle = MODE_META.get(mode, MODE_META["top5"])
+    post, story, caption = await asyncio.to_thread(
+        create_selection_bundle,
+        items,
+        title,
+        subtitle,
+        f"auto_{mode}",
+    )
+
+    cleanup_public_media()
+    public_path, public_url = await asyncio.to_thread(
+        expose_media_file,
+        Path(post),
+    )
+    await asyncio.sleep(1)
+
+    media_id = await asyncio.to_thread(
+        publish_image_to_instagram,
+        public_url,
+        caption,
+    )
+
+    # Сохраняем результат только после успешной публикации.
+    state = load_state()
+    used = set(state.get("used", []))
+    used.update(item.phone for item in items)
+    state["used"] = sorted(used)
+    state["last_instagram_media_id"] = media_id
+    state["last_instagram_error"] = None
+
+    history = list(state.get("ig_auto_history", []))
+    history.append({
+        "at": datetime.now(TZ).isoformat(),
+        "mode": mode,
+        "phones": [x.phone for x in items],
+        "media_id": media_id,
+        "post": str(post),
+        "public_media": str(public_path),
+    })
+    state["ig_auto_history"] = history[-50:]
+    save_state(state)
+
+    if notify:
+        kind = "ТОП-5" if mode == "top5" else "Номер дня"
+        phones = "\n".join(f"• {format_phone(x.phone)}" for x in items)
+        await bot.send_message(
+            chat_id,
+            f"🤖 Автопилот опубликовал: {kind} ✅\n\n"
+            f"{phones}\n\n"
+            f"Instagram Media ID: {media_id}"
+        )
+
+    return media_id
+
+
+async def instagram_autopilot_loop(bot: Bot) -> None:
+    await asyncio.sleep(15)
+    while True:
+        try:
+            state = load_state()
+            if not state.get("ig_auto_enabled"):
+                await asyncio.sleep(30)
+                continue
+
+            owner = get_owner_id()
+            if not owner:
+                await asyncio.sleep(30)
+                continue
+
+            now = datetime.now(TZ)
+            today = now.date().isoformat()
+            current_hm = now.strftime("%H:%M")
+
+            top5_time = state.get("ig_auto_top5_time", "10:00")
+            day_time = state.get("ig_auto_day_time", "19:00")
+
+            if (
+                current_hm == top5_time
+                and state.get("ig_auto_last_top5_date") != today
+            ):
+                try:
+                    await autopublish_mode(bot, owner, "top5", notify=True)
+                    state = load_state()
+                    state["ig_auto_last_top5_date"] = today
+                    save_state(state)
+                except Exception as exc:
+                    logging.exception("Auto TOP-5 failed")
+                    state = load_state()
+                    state["last_instagram_error"] = f"AUTO TOP5: {type(exc).__name__}: {exc}"
+                    save_state(state)
+                    await bot.send_message(owner, f"❌ Авто ТОП-5: {exc}")
+
+            if (
+                current_hm == day_time
+                and state.get("ig_auto_last_day_date") != today
+            ):
+                try:
+                    await autopublish_mode(bot, owner, "day", notify=True)
+                    state = load_state()
+                    state["ig_auto_last_day_date"] = today
+                    save_state(state)
+                except Exception as exc:
+                    logging.exception("Auto Number Day failed")
+                    state = load_state()
+                    state["last_instagram_error"] = f"AUTO DAY: {type(exc).__name__}: {exc}"
+                    save_state(state)
+                    await bot.send_message(owner, f"❌ Авто Номер дня: {exc}")
+
+        except Exception:
+            logging.exception("Instagram autopilot loop error")
+
+        await asyncio.sleep(20)
+
+
+
 # =========================
 # Telegram UI
 # =========================
@@ -1722,6 +1927,7 @@ MENU = ReplyKeyboardMarkup(
         ],
         [KeyboardButton(text="📚 Все номера по тарифам")],
         [KeyboardButton(text="🎬 Reels")],
+        [KeyboardButton(text="📸 Автопубликация")],
         [
             KeyboardButton(text="🔄 Обновить из Безлимит"),
             KeyboardButton(text="🤖 Автопилот"),
@@ -1978,6 +2184,117 @@ async def api_status(message: Message):
         f"Последнее обновление: {state.get('api_updated_at') or 'нет'}\n"
         f"Последняя ошибка: {state.get('api_last_error') or 'нет'}"
     )
+
+
+
+@router.message(F.text == "📸 Автопубликация")
+async def instagram_auto_menu(message: Message):
+    if await deny(message):
+        return
+    state = load_state()
+    await message.answer(
+        _format_auto_status(state),
+        reply_markup=auto_publish_keyboard(state),
+    )
+
+
+@router.message(Command("autopublish"))
+async def instagram_auto_command(message: Message):
+    if await deny(message):
+        return
+    state = load_state()
+    await message.answer(
+        _format_auto_status(state),
+        reply_markup=auto_publish_keyboard(state),
+    )
+
+
+@router.callback_query(F.data == "igauto:toggle")
+async def instagram_auto_toggle(callback: CallbackQuery):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    state = load_state()
+    new_value = not bool(state.get("ig_auto_enabled"))
+
+    if new_value and not instagram_configured():
+        await callback.answer(
+            "Сначала настрой Instagram API: /igstatus",
+            show_alert=True,
+        )
+        return
+
+    state["ig_auto_enabled"] = new_value
+    save_state(state)
+    await callback.answer("Сохранено")
+    if callback.message:
+        await callback.message.edit_text(
+            _format_auto_status(state),
+            reply_markup=auto_publish_keyboard(state),
+        )
+
+
+@router.callback_query(F.data.startswith("igauto:top5:"))
+async def instagram_auto_top5_time(callback: CallbackQuery):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    value = callback.data.rsplit(":", 1)[-1]
+    _parse_hhmm(value)
+    state = load_state()
+    state["ig_auto_top5_time"] = value
+    save_state(state)
+    await callback.answer(f"ТОП-5 → {value}")
+    if callback.message:
+        await callback.message.edit_text(
+            _format_auto_status(state),
+            reply_markup=auto_publish_keyboard(state),
+        )
+
+
+@router.callback_query(F.data.startswith("igauto:day:"))
+async def instagram_auto_day_time(callback: CallbackQuery):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    value = callback.data.rsplit(":", 1)[-1]
+    _parse_hhmm(value)
+    state = load_state()
+    state["ig_auto_day_time"] = value
+    save_state(state)
+    await callback.answer(f"Номер дня → {value}")
+    if callback.message:
+        await callback.message.edit_text(
+            _format_auto_status(state),
+            reply_markup=auto_publish_keyboard(state),
+        )
+
+
+@router.callback_query(F.data == "igauto:test:top5")
+async def instagram_auto_test_top5(callback: CallbackQuery, bot: Bot):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Запускаю тест ТОП-5…")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    try:
+        await autopublish_mode(bot, chat_id, "top5", notify=True)
+    except Exception as exc:
+        await bot.send_message(chat_id, f"❌ Тест ТОП-5: {exc}")
+
+
+@router.callback_query(F.data == "igauto:test:day")
+async def instagram_auto_test_day(callback: CallbackQuery, bot: Bot):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Запускаю тест Номер дня…")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    try:
+        await autopublish_mode(bot, chat_id, "day", notify=True)
+    except Exception as exc:
+        await bot.send_message(chat_id, f"❌ Тест Номер дня: {exc}")
 
 
 @router.message(F.text == "🤖 Автопилот")
@@ -2365,10 +2682,12 @@ async def main():
 
     web_runner = await start_public_server()
     task = asyncio.create_task(autopilot_loop(bot))
+    ig_auto_task = asyncio.create_task(instagram_autopilot_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
         task.cancel()
+        ig_auto_task.cancel()
         await web_runner.cleanup()
         await bot.session.close()
 

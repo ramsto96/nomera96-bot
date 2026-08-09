@@ -89,7 +89,7 @@ OWNER_FILE = DATA_DIR / "owner_id.txt"
 
 router = Router()
 
-BUILD_VERSION = "v14-full-autopilot"
+BUILD_VERSION = "v15-editable-schedule"
 
 TARIFF_RE = re.compile(
     r"тариф\s*:\s*([\d\s]+)\s*(?:руб(?:\.|лей)?|₽)?\s*(?:/|в)?\s*мес",
@@ -124,9 +124,12 @@ DEFAULT_STATE = {
     "last_instagram_error": None,
     "ig_auto_enabled": False,
     "ig_auto_top5_time": "10:00",
+    "ig_auto_budget_time": "15:00",
     "ig_auto_day_time": "19:00",
     "ig_auto_last_top5_date": None,
+    "ig_auto_last_budget_date": None,
     "ig_auto_last_day_date": None,
+    "ig_auto_awaiting_time_mode": None,
     "ig_auto_history": [],
 }
 
@@ -1732,39 +1735,68 @@ def _format_auto_status(state: dict) -> str:
     enabled = bool(state.get("ig_auto_enabled"))
     return (
         "📸 АВТОПУБЛИКАЦИЯ INSTAGRAM\n\n"
-        f"Статус: {'ВКЛЮЧЕНА ✅' if enabled else 'ВЫКЛЮЧЕНА ⛔️'}\n"
-        f"🔥 ТОП-5: {state.get('ig_auto_top5_time', '10:00')} (Москва)\n"
-        f"⭐ Номер дня: {state.get('ig_auto_day_time', '19:00')} (Москва)\n\n"
-        "Что делает бот автоматически:\n"
-        "API Безлимита → отбор → картинка → Instagram → история.\n\n"
+        f"Статус: {'ВКЛЮЧЕНА ✅' if enabled else 'ВЫКЛЮЧЕНА ⛔️'}\n\n"
+        f"🔥 ТОП-5 — {state.get('ig_auto_top5_time', '10:00')}\n"
+        f"💰 До 1000 ₽ — {state.get('ig_auto_budget_time', '15:00')}\n"
+        f"⭐ Номер дня — {state.get('ig_auto_day_time', '19:00')}\n"
+        "🌍 Часовой пояс — Москва\n\n"
+        "Время можно менять прямо здесь — без GitHub и Railway.\n"
         "Номера, которые уже публиковались, повторно не выбираются."
     )
 
 
 def auto_publish_keyboard(state: dict) -> InlineKeyboardMarkup:
     enabled = bool(state.get("ig_auto_enabled"))
+    top5_time = state.get("ig_auto_top5_time", "10:00")
+    budget_time = state.get("ig_auto_budget_time", "15:00")
+    day_time = state.get("ig_auto_day_time", "19:00")
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⛔️ Выключить" if enabled else "✅ Включить",
+                    text="⛔️ Выключить" if enabled else "✅ Включить автопубликацию",
                     callback_data="igauto:toggle",
                 )
             ],
             [
-                InlineKeyboardButton(text="🔥 ТОП-5 10:00", callback_data="igauto:top5:10:00"),
-                InlineKeyboardButton(text="🔥 ТОП-5 12:00", callback_data="igauto:top5:12:00"),
+                InlineKeyboardButton(
+                    text=f"🕒 ТОП-5 — {top5_time}",
+                    callback_data="igauto:edit:top5",
+                )
             ],
             [
-                InlineKeyboardButton(text="⭐ День 18:00", callback_data="igauto:day:18:00"),
-                InlineKeyboardButton(text="⭐ День 20:00", callback_data="igauto:day:20:00"),
+                InlineKeyboardButton(
+                    text=f"🕒 До 1000 ₽ — {budget_time}",
+                    callback_data="igauto:edit:budget",
+                )
             ],
             [
-                InlineKeyboardButton(text="🧪 Тест ТОП-5 сейчас", callback_data="igauto:test:top5"),
-                InlineKeyboardButton(text="🧪 Тест Номер дня", callback_data="igauto:test:day"),
+                InlineKeyboardButton(
+                    text=f"🕒 Номер дня — {day_time}",
+                    callback_data="igauto:edit:day",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧪 Тест ТОП-5",
+                    callback_data="igauto:test:top5",
+                ),
+                InlineKeyboardButton(
+                    text="🧪 Тест До 1000",
+                    callback_data="igauto:test:budget",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧪 Тест Номер дня",
+                    callback_data="igauto:test:day",
+                )
             ],
         ]
     )
+
+
 
 
 async def autopublish_mode(
@@ -1839,7 +1871,7 @@ async def autopublish_mode(
     save_state(state)
 
     if notify:
-        kind = "ТОП-5" if mode == "top5" else "Номер дня"
+        kind = {"top5": "ТОП-5", "budget": "До 1000 ₽", "day": "Номер дня"}.get(mode, mode)
         phones = "\n".join(f"• {format_phone(x.phone)}" for x in items)
         await bot.send_message(
             chat_id,
@@ -1870,6 +1902,7 @@ async def instagram_autopilot_loop(bot: Bot) -> None:
             current_hm = now.strftime("%H:%M")
 
             top5_time = state.get("ig_auto_top5_time", "10:00")
+            budget_time = state.get("ig_auto_budget_time", "15:00")
             day_time = state.get("ig_auto_day_time", "19:00")
 
             if (
@@ -1887,6 +1920,22 @@ async def instagram_autopilot_loop(bot: Bot) -> None:
                     state["last_instagram_error"] = f"AUTO TOP5: {type(exc).__name__}: {exc}"
                     save_state(state)
                     await bot.send_message(owner, f"❌ Авто ТОП-5: {exc}")
+
+            if (
+                current_hm == budget_time
+                and state.get("ig_auto_last_budget_date") != today
+            ):
+                try:
+                    await autopublish_mode(bot, owner, "budget", notify=True)
+                    state = load_state()
+                    state["ig_auto_last_budget_date"] = today
+                    save_state(state)
+                except Exception as exc:
+                    logging.exception("Auto Budget failed")
+                    state = load_state()
+                    state["last_instagram_error"] = f"AUTO BUDGET: {type(exc).__name__}: {exc}"
+                    save_state(state)
+                    await bot.send_message(owner, f"❌ Авто До 1000 ₽: {exc}")
 
             if (
                 current_hm == day_time
@@ -2235,40 +2284,84 @@ async def instagram_auto_toggle(callback: CallbackQuery):
         )
 
 
-@router.callback_query(F.data.startswith("igauto:top5:"))
-async def instagram_auto_top5_time(callback: CallbackQuery):
+
+@router.callback_query(F.data.startswith("igauto:edit:"))
+async def instagram_auto_edit_time(callback: CallbackQuery, bot: Bot):
     if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    value = callback.data.rsplit(":", 1)[-1]
-    _parse_hhmm(value)
-    state = load_state()
-    state["ig_auto_top5_time"] = value
-    save_state(state)
-    await callback.answer(f"ТОП-5 → {value}")
-    if callback.message:
-        await callback.message.edit_text(
-            _format_auto_status(state),
-            reply_markup=auto_publish_keyboard(state),
-        )
 
-
-@router.callback_query(F.data.startswith("igauto:day:"))
-async def instagram_auto_day_time(callback: CallbackQuery):
-    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+    mode = callback.data.rsplit(":", 1)[-1]
+    labels = {
+        "top5": "🔥 ТОП-5",
+        "budget": "💰 До 1000 ₽",
+        "day": "⭐ Номер дня",
+    }
+    if mode not in labels:
+        await callback.answer("Неизвестный режим", show_alert=True)
         return
-    value = callback.data.rsplit(":", 1)[-1]
-    _parse_hhmm(value)
+
     state = load_state()
-    state["ig_auto_day_time"] = value
+    state["ig_auto_awaiting_time_mode"] = mode
     save_state(state)
-    await callback.answer(f"Номер дня → {value}")
-    if callback.message:
-        await callback.message.edit_text(
-            _format_auto_status(state),
-            reply_markup=auto_publish_keyboard(state),
-        )
+
+    await callback.answer()
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    await bot.send_message(
+        chat_id,
+        f"🕒 Изменение времени: {labels[mode]}\\n\\n"
+        "Отправь новое время одним сообщением в формате ЧЧ:ММ.\\n"
+        "Например: 10:30",
+    )
+
+
+@router.message(F.text.regexp(r"^\\s*\\d{1,2}:\\d{2}\\s*$"))
+async def instagram_auto_receive_time(message: Message):
+    if await deny(message):
+        return
+
+    state = load_state()
+    mode = state.get("ig_auto_awaiting_time_mode")
+    if mode not in {"top5", "budget", "day"}:
+        return
+
+    value = (message.text or "").strip()
+    try:
+        _parse_hhmm(value)
+    except ValueError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+
+    key_map = {
+        "top5": "ig_auto_top5_time",
+        "budget": "ig_auto_budget_time",
+        "day": "ig_auto_day_time",
+    }
+    label_map = {
+        "top5": "🔥 ТОП-5",
+        "budget": "💰 До 1000 ₽",
+        "day": "⭐ Номер дня",
+    }
+
+    state[key_map[mode]] = value
+    state["ig_auto_awaiting_time_mode"] = None
+    save_state(state)
+
+    await message.answer(
+        f"✅ {label_map[mode]} теперь будет публиковаться в {value} по Москве.",
+        reply_markup=auto_publish_keyboard(state),
+    )
+
+
+@router.message(Command("schedule"))
+async def instagram_schedule_command(message: Message):
+    if await deny(message):
+        return
+    state = load_state()
+    await message.answer(
+        _format_auto_status(state),
+        reply_markup=auto_publish_keyboard(state),
+    )
 
 
 @router.callback_query(F.data == "igauto:test:top5")
@@ -2282,6 +2375,20 @@ async def instagram_auto_test_top5(callback: CallbackQuery, bot: Bot):
         await autopublish_mode(bot, chat_id, "top5", notify=True)
     except Exception as exc:
         await bot.send_message(chat_id, f"❌ Тест ТОП-5: {exc}")
+
+
+
+@router.callback_query(F.data == "igauto:test:budget")
+async def instagram_auto_test_budget(callback: CallbackQuery, bot: Bot):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Запускаю тест До 1000 ₽…")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+    try:
+        await autopublish_mode(bot, chat_id, "budget", notify=True)
+    except Exception as exc:
+        await bot.send_message(chat_id, f"❌ Тест До 1000 ₽: {exc}")
 
 
 @router.callback_query(F.data == "igauto:test:day")

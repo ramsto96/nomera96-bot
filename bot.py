@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import zipfile
 import urllib.request
 import urllib.parse
@@ -88,7 +89,7 @@ OWNER_FILE = DATA_DIR / "owner_id.txt"
 
 router = Router()
 
-BUILD_VERSION = "v13.1-instagram-login"
+BUILD_VERSION = "v13.2-instagram-wait-ready"
 
 TARIFF_RE = re.compile(
     r"тариф\s*:\s*([\d\s]+)\s*(?:руб(?:\.|лей)?|₽)?\s*(?:/|в)?\s*мес",
@@ -1551,6 +1552,41 @@ def resolve_ig_user_id() -> tuple[str, str]:
     return user_id, username
 
 
+def wait_for_instagram_container(
+    creation_id: str,
+    timeout_seconds: int = 180,
+    poll_seconds: int = 10,
+) -> str:
+    """Wait until Instagram finishes processing the media container."""
+    deadline = time.monotonic() + timeout_seconds
+    last_status = "UNKNOWN"
+
+    while time.monotonic() < deadline:
+        payload = _get_json(
+            _graph_url(creation_id),
+            {
+                "fields": "id,status_code",
+                "access_token": IG_ACCESS_TOKEN,
+            },
+        )
+        last_status = str(payload.get("status_code") or "UNKNOWN").upper()
+
+        if last_status in {"FINISHED", "PUBLISHED"}:
+            return last_status
+
+        if last_status in {"ERROR", "EXPIRED"}:
+            raise InstagramPublishError(
+                f"Контейнер Instagram завершился со статусом {last_status}."
+            )
+
+        time.sleep(poll_seconds)
+
+    raise InstagramPublishError(
+        f"Instagram слишком долго обрабатывает изображение "
+        f"(последний статус: {last_status}). Попробуй публикацию ещё раз."
+    )
+
+
 def publish_image_to_instagram(image_url: str, caption: str) -> str:
     if not IG_ACCESS_TOKEN:
         raise InstagramPublishError(
@@ -1573,13 +1609,31 @@ def publish_image_to_instagram(image_url: str, caption: str) -> str:
     if not creation_id:
         raise InstagramPublishError("Meta не вернула creation_id.")
 
-    published = _post_form_json(
-        _graph_url(f"{ig_user_id}/media_publish"),
-        {
-            "creation_id": creation_id,
-            "access_token": IG_ACCESS_TOKEN,
-        },
-    )
+    # Wait until Instagram has actually finished processing the image.
+    # Publishing too early may return: "Media ID is not available".
+    wait_for_instagram_container(creation_id)
+
+    try:
+        published = _post_form_json(
+            _graph_url(f"{ig_user_id}/media_publish"),
+            {
+                "creation_id": creation_id,
+                "access_token": IG_ACCESS_TOKEN,
+            },
+        )
+    except InstagramPublishError as exc:
+        # Rare race: FINISHED can appear just before media_publish is ready.
+        if "media id is not available" not in str(exc).lower():
+            raise
+        time.sleep(10)
+        published = _post_form_json(
+            _graph_url(f"{ig_user_id}/media_publish"),
+            {
+                "creation_id": creation_id,
+                "access_token": IG_ACCESS_TOKEN,
+            },
+        )
+
     media_id = str(published.get("id") or "")
     if not media_id:
         raise InstagramPublishError("Meta не вернула ID опубликованного поста.")

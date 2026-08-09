@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import zipfile
 import urllib.request
 import urllib.parse
@@ -16,6 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiohttp import web
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -48,6 +50,17 @@ BEZLIMIT_CACHE_MINUTES = int(os.getenv("BEZLIMIT_CACHE_MINUTES", "10"))
 BEZLIMIT_FETCH_PAGES = max(1, min(12, int(os.getenv("BEZLIMIT_FETCH_PAGES", "5"))))
 BEZLIMIT_PER_PAGE = max(20, min(100, int(os.getenv("BEZLIMIT_PER_PAGE", "100"))))
 
+IG_USER_ID = os.getenv("IG_USER_ID", "").strip()
+IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN", "").strip()
+META_GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v23.0").strip() or "v23.0"
+
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+if not PUBLIC_BASE_URL and RAILWAY_PUBLIC_DOMAIN:
+    PUBLIC_BASE_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}"
+
+PORT = int(os.getenv("PORT", "8080"))
+
 CALL_TO_ACTION = (
     os.getenv("CALL_TO_ACTION", "Пиши в Direct / WhatsApp").strip()
     or "Пиши в Direct / WhatsApp"
@@ -65,15 +78,17 @@ TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Moscow"))
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "output"
+PUBLIC_MEDIA_DIR = ROOT / "public_media"
 DATA_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+PUBLIC_MEDIA_DIR.mkdir(exist_ok=True)
 
 STATE_FILE = DATA_DIR / "autopilot_state.json"
 OWNER_FILE = DATA_DIR / "owner_id.txt"
 
 router = Router()
 
-BUILD_VERSION = "v12-bezlimit-api"
+BUILD_VERSION = "v13.1-instagram-login"
 
 TARIFF_RE = re.compile(
     r"тариф\s*:\s*([\d\s]+)\s*(?:руб(?:\.|лей)?|₽)?\s*(?:/|в)?\s*мес",
@@ -103,6 +118,9 @@ DEFAULT_STATE = {
     "last_auto_date": None,
     "api_updated_at": None,
     "api_last_error": None,
+    "last_approved": None,
+    "last_instagram_media_id": None,
+    "last_instagram_error": None,
 }
 
 
@@ -1401,6 +1419,239 @@ async def get_live_catalog(
 
 
 
+
+# =========================
+# Instagram / Meta publishing
+# =========================
+
+class InstagramPublishError(RuntimeError):
+    pass
+
+
+def instagram_configured() -> bool:
+    return bool(IG_ACCESS_TOKEN and PUBLIC_BASE_URL)
+
+
+def _graph_url(path: str) -> str:
+    return f"https://graph.instagram.com/{META_GRAPH_VERSION}/{path.lstrip('/')}"
+
+
+def _post_form_json(url: str, fields: dict[str, object]) -> dict:
+    encoded = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=encoded,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Bearer {IG_ACCESS_TOKEN}",
+            "User-Agent": "Nomera96Bot/13.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body)
+            msg = (
+                parsed.get("error", {}).get("message")
+                if isinstance(parsed, dict)
+                else body
+            )
+        except Exception:
+            msg = f"HTTP {exc.code}"
+        raise InstagramPublishError(str(msg or f"HTTP {exc.code}")) from exc
+    except urllib.error.URLError as exc:
+        raise InstagramPublishError(f"Нет соединения с Meta: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise InstagramPublishError("Meta вернула некорректный JSON.") from exc
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise InstagramPublishError(
+            str(payload["error"].get("message") or payload["error"])
+        )
+    if not isinstance(payload, dict):
+        raise InstagramPublishError("Неожиданный ответ Meta API.")
+    return payload
+
+
+def _safe_public_name(source: Path) -> str:
+    stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S_%f")
+    return f"nomera96_{stamp}{source.suffix.lower() or '.png'}"
+
+
+def expose_media_file(source: Path) -> tuple[Path, str]:
+    if not PUBLIC_BASE_URL:
+        raise InstagramPublishError(
+            "Нет PUBLIC_BASE_URL/RAILWAY_PUBLIC_DOMAIN. "
+            "В Railway нужно включить Public Networking → Generate Domain."
+        )
+
+    if not source.exists():
+        raise InstagramPublishError("Файл поста уже недоступен.")
+
+    name = _safe_public_name(source)
+    dest = PUBLIC_MEDIA_DIR / name
+    shutil.copy2(source, dest)
+    url = f"{PUBLIC_BASE_URL}/media/{urllib.parse.quote(name)}"
+    return dest, url
+
+
+def _get_json(url: str, params: dict[str, object]) -> dict:
+    query = urllib.parse.urlencode(params, doseq=True)
+    full_url = url + ("?" if "?" not in url else "&") + query
+    req = urllib.request.Request(
+        full_url,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {IG_ACCESS_TOKEN}",
+            "User-Agent": "Nomera96Bot/13.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body)
+            msg = parsed.get("error", {}).get("message") if isinstance(parsed, dict) else body
+        except Exception:
+            msg = f"HTTP {exc.code}"
+        raise InstagramPublishError(str(msg or f"HTTP {exc.code}")) from exc
+    except urllib.error.URLError as exc:
+        raise InstagramPublishError(f"Нет соединения с Instagram API: {exc.reason}") from exc
+
+    if not isinstance(payload, dict):
+        raise InstagramPublishError("Неожиданный ответ Instagram API.")
+    if payload.get("error"):
+        raise InstagramPublishError(str(payload["error"].get("message") or payload["error"]))
+    return payload
+
+
+def resolve_ig_user_id() -> tuple[str, str]:
+    if not IG_ACCESS_TOKEN:
+        raise InstagramPublishError("Не задан IG_ACCESS_TOKEN.")
+
+    payload = _get_json(
+        _graph_url("me"),
+        {
+            "fields": "id,username",
+            "access_token": IG_ACCESS_TOKEN,
+        },
+    )
+    user_id = str(payload.get("id") or "")
+    username = str(payload.get("username") or "")
+    if not user_id:
+        raise InstagramPublishError("Не удалось определить Instagram User ID по токену.")
+    return user_id, username
+
+
+def publish_image_to_instagram(image_url: str, caption: str) -> str:
+    if not IG_ACCESS_TOKEN:
+        raise InstagramPublishError(
+            "Не задан IG_ACCESS_TOKEN в Railway Variables."
+        )
+
+    ig_user_id = IG_USER_ID
+    if not ig_user_id:
+        ig_user_id, _username = resolve_ig_user_id()
+
+    created = _post_form_json(
+        _graph_url(f"{ig_user_id}/media"),
+        {
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": IG_ACCESS_TOKEN,
+        },
+    )
+    creation_id = str(created.get("id") or "")
+    if not creation_id:
+        raise InstagramPublishError("Meta не вернула creation_id.")
+
+    published = _post_form_json(
+        _graph_url(f"{ig_user_id}/media_publish"),
+        {
+            "creation_id": creation_id,
+            "access_token": IG_ACCESS_TOKEN,
+        },
+    )
+    media_id = str(published.get("id") or "")
+    if not media_id:
+        raise InstagramPublishError("Meta не вернула ID опубликованного поста.")
+    return media_id
+
+
+def cleanup_public_media(max_age_hours: int = 24) -> None:
+    cutoff = datetime.now().timestamp() - max_age_hours * 3600
+    for path in PUBLIC_MEDIA_DIR.glob("*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except Exception:
+            logging.exception("Не удалось удалить старый public media %s", path)
+
+
+async def media_handler(request: web.Request) -> web.StreamResponse:
+    name = request.match_info.get("name", "")
+    # Не разрешаем path traversal.
+    safe = Path(name).name
+    if safe != name:
+        raise web.HTTPNotFound()
+    path = PUBLIC_MEDIA_DIR / safe
+    if not path.exists() or not path.is_file():
+        raise web.HTTPNotFound()
+    return web.FileResponse(path)
+
+
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "ok": True,
+            "service": "nomera96-bot",
+            "version": BUILD_VERSION,
+            "instagram_configured": instagram_configured(),
+        }
+    )
+
+
+async def start_public_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/media/{name}", media_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info("Public media server listening on 0.0.0.0:%s", PORT)
+    return runner
+
+
+def instagram_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📲 Опубликовать в Instagram",
+                    callback_data="ig:publish",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 Только файлы",
+                    callback_data="ig:skip",
+                )
+            ],
+        ]
+    )
+
+
+
 # =========================
 # Telegram UI
 # =========================
@@ -1719,7 +1970,7 @@ async def version(message: Message):
         return
     await message.answer(
         f"✅ Запущена версия: {BUILD_VERSION}\n"
-        "Стиль: синие тарифные плашки / группировка по тарифам / Direct + WhatsApp"
+        "Источник: Bezlimit API • ТОП-5 одной картинкой • Instagram publish"
     )
 
 
@@ -1762,6 +2013,14 @@ async def approve(callback: CallbackQuery, bot: Bot):
     state["used"] = sorted(used)
     state["draft"] = []
     state["draft_mode"] = None
+    state["last_approved"] = {
+        "post": str(post),
+        "story": str(story),
+        "caption": caption,
+        "mode": mode,
+        "created_at": datetime.now(TZ).isoformat(),
+        "phones": [x.phone for x in items],
+    }
     save_state(state)
 
     await callback.answer("Одобрено ✅")
@@ -1783,6 +2042,142 @@ async def approve(callback: CallbackQuery, bot: Bot):
         caption="✅ Сторис 9:16 без сжатия",
     )
     await bot.send_message(chat_id, "📝 Описание:\n\n" + caption)
+
+    if instagram_configured():
+        await bot.send_message(
+            chat_id,
+            "Куда дальше?",
+            reply_markup=instagram_keyboard(),
+        )
+    else:
+        await bot.send_message(
+            chat_id,
+            "📲 Instagram-публикация уже встроена, но ещё не хватает "
+            "IG_ACCESS_TOKEN или публичного домена Railway.\n"
+            "Проверь командой /igstatus."
+        )
+
+
+@router.callback_query(F.data == "ig:publish")
+async def publish_instagram(callback: CallbackQuery, bot: Bot):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    state = load_state()
+    approved = state.get("last_approved") or {}
+    post_raw = approved.get("post")
+    caption = str(approved.get("caption") or "")
+
+    if not post_raw:
+        await callback.answer("Нет одобренного поста", show_alert=True)
+        return
+
+    if not instagram_configured():
+        await callback.answer("Instagram API ещё не настроен", show_alert=True)
+        if callback.message:
+            await callback.message.answer(
+                "Нужны IG_ACCESS_TOKEN и публичный домен Railway.\n"
+                "Проверка: /igstatus"
+            )
+        return
+
+    await callback.answer("Публикую…")
+    chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+
+    try:
+        cleanup_public_media()
+        public_path, public_url = await asyncio.to_thread(
+            expose_media_file,
+            Path(post_raw),
+        )
+
+        # Даём Railway успеть начать отдавать файл по HTTPS.
+        await asyncio.sleep(1)
+
+        media_id = await asyncio.to_thread(
+            publish_image_to_instagram,
+            public_url,
+            caption,
+        )
+
+        state = load_state()
+        state["last_instagram_media_id"] = media_id
+        state["last_instagram_error"] = None
+        if isinstance(state.get("last_approved"), dict):
+            state["last_approved"]["instagram_media_id"] = media_id
+            state["last_approved"]["public_media"] = str(public_path)
+        save_state(state)
+
+        if callback.message:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        await bot.send_message(
+            chat_id,
+            f"✅ Опубликовано в Instagram.\nMedia ID: {media_id}"
+        )
+
+    except Exception as exc:
+        logging.exception("Instagram publish failed")
+        state = load_state()
+        state["last_instagram_error"] = f"{type(exc).__name__}: {exc}"
+        save_state(state)
+        await bot.send_message(
+            chat_id,
+            f"❌ Instagram не опубликовал пост:\n{exc}"
+        )
+
+
+@router.callback_query(F.data == "ig:skip")
+async def skip_instagram(callback: CallbackQuery):
+    if not callback.from_user or not claim_or_check_owner(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Оставил только файлы")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+@router.message(Command("igstatus"))
+async def instagram_status(message: Message):
+    if await deny(message):
+        return
+
+    state = load_state()
+    resolved_id = IG_USER_ID
+    resolved_username = ""
+    token_check = "НЕТ ❌"
+    token_error = ""
+    if IG_ACCESS_TOKEN:
+        try:
+            resolved_id, resolved_username = await asyncio.to_thread(resolve_ig_user_id)
+            token_check = "РАБОТАЕТ ✅"
+        except Exception as exc:
+            token_check = "ОШИБКА ❌"
+            token_error = str(exc)
+
+    parts = [
+        "📸 Instagram API (Instagram Login)",
+        "",
+        f"IG_ACCESS_TOKEN: {'ЕСТЬ ✅' if IG_ACCESS_TOKEN else 'НЕТ ❌'}",
+        f"Проверка токена: {token_check}",
+        f"Аккаунт: @{resolved_username}" if resolved_username else "Аккаунт: не определён",
+        f"IG User ID: {resolved_id or 'определится автоматически'}",
+        f"Публичная ссылка Railway: {'ЕСТЬ ✅' if PUBLIC_BASE_URL else 'НЕТ ❌'}",
+        f"Graph API: graph.instagram.com / {META_GRAPH_VERSION}",
+        f"Готов к публикации: {'ДА ✅' if (instagram_configured() and token_check == 'РАБОТАЕТ ✅') else 'НЕТ ❌'}",
+        f"Последний Media ID: {state.get('last_instagram_media_id') or 'нет'}",
+        f"Последняя ошибка: {state.get('last_instagram_error') or 'нет'}",
+    ]
+    if token_error:
+        parts.append(f"Ошибка токена: {token_error}")
+    await message.answer("\n".join(parts))
 
 
 @router.callback_query(F.data == "draft:next")
@@ -1914,11 +2309,13 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
+    web_runner = await start_public_server()
     task = asyncio.create_task(autopilot_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
         task.cancel()
+        await web_runner.cleanup()
         await bot.session.close()
 
 

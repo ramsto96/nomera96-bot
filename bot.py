@@ -96,7 +96,7 @@ IG_STORIES_INTERVAL_SECONDS = max(60, int(os.getenv("IG_STORIES_INTERVAL_SECONDS
 
 router = Router()
 
-BUILD_VERSION = "v16-city-single-posts"
+BUILD_VERSION = "v17-simple-number-feed"
 
 TARIFF_RE = re.compile(
     r"тариф\s*:\s*([\d\s]+)\s*(?:руб(?:\.|лей)?|₽)?\s*(?:/|в)?\s*мес",
@@ -292,12 +292,55 @@ def build_items(catalog: list[tuple[str, int]]) -> list[NumberItem]:
     ]
 
 
+
+def select_feed_item(
+    catalog: list[tuple[str, int]],
+    used: set[str],
+) -> NumberItem | None:
+    """
+    Main sales feed:
+    70% -> tariffs <= 950 ₽
+    20% -> 951..1600 ₽
+    10% -> > 1600 ₽
+    Inside a price group, favor beautiful memorable numbers.
+    """
+    items = [x for x in build_items(catalog) if x.phone not in used]
+    if not items:
+        items = build_items(catalog)
+    if not items:
+        return None
+
+    groups = {
+        "cheap": [x for x in items if x.price <= 950],
+        "mid": [x for x in items if 950 < x.price <= 1600],
+        "high": [x for x in items if x.price > 1600],
+    }
+
+    roll = random.random()
+    preferred = "cheap" if roll < 0.70 else ("mid" if roll < 0.90 else "high")
+
+    pool = groups.get(preferred) or groups["cheap"] or groups["mid"] or groups["high"]
+    if not pool:
+        return None
+
+    pool.sort(key=lambda x: (x.beauty, -x.price), reverse=True)
+
+    # Choose among the strongest few so the feed doesn't look repetitive.
+    top = pool[: min(12, len(pool))]
+    weights = list(range(len(top), 0, -1))
+    return random.choices(top, weights=weights, k=1)[0]
+
+
 def select_mode(
     catalog: list[tuple[str, int]],
     mode: str,
     used: set[str],
     limit: int = 5,
 ) -> list[NumberItem]:
+    if mode == "feed":
+        item = select_feed_item(catalog, used)
+        return [item] if item else []
+
     items = build_items(catalog)
 
     if mode == "budget":
@@ -1062,6 +1105,123 @@ def render_city_single(
     img.convert("RGB").save(target, "PNG", optimize=True)
 
 
+
+SINGLE_TEMPLATE_FILE = ROOT / "nomera96_single_template.png"
+
+
+def _template_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
+    path = FONT_BOLD if bold else FONT_REGULAR
+    return ImageFont.truetype(path, size)
+
+
+def _draw_centered_text(
+    d: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    value: str,
+    font_obj: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int],
+) -> None:
+    x1, y1, x2, y2 = box
+    bb = d.textbbox((0, 0), value, font=font_obj)
+    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    d.text(
+        (x1 + (x2 - x1 - tw) // 2, y1 + (y2 - y1 - th) // 2 - bb[1]),
+        value,
+        font=font_obj,
+        fill=fill,
+    )
+
+
+def render_exact_single_template(
+    item: NumberItem,
+    target: Path,
+    story: bool = False,
+) -> None:
+    """
+    The square post uses the approved static Nomera96 artwork.
+    Only live number/tariff values are overlaid.
+    Telegram and Instagram receive this exact same post.png.
+    """
+    if not SINGLE_TEMPLATE_FILE.exists():
+        raise FileNotFoundError(
+            "Нет nomera96_single_template.png рядом с bot.py."
+        )
+
+    base = Image.open(SINGLE_TEMPLATE_FILE).convert("RGB")
+    d = ImageDraw.Draw(base)
+
+    # Phone panel: cover old sample digits, preserving the original neon frame.
+    d.rounded_rectangle(
+        (105, 452, 1148, 586),
+        radius=34,
+        fill=(2, 10, 23),
+    )
+
+    phone = format_phone(item.phone)
+    phone_font = _template_font(86, True)
+    while d.textbbox((0, 0), phone, font=phone_font)[2] > 990:
+        phone_font = _template_font(phone_font.size - 2, True)
+
+    # Last 2 digits in blue when possible.
+    prefix = phone[:-2]
+    suffix = phone[-2:]
+    pre_bb = d.textbbox((0, 0), prefix, font=phone_font)
+    suf_bb = d.textbbox((0, 0), suffix, font=phone_font)
+    total_w = (pre_bb[2] - pre_bb[0]) + (suf_bb[2] - suf_bb[0])
+    start_x = (1254 - total_w) // 2
+    y = 476
+    d.text((start_x, y), prefix, font=phone_font, fill=(255, 255, 255))
+    d.text(
+        (start_x + (pre_bb[2] - pre_bb[0]), y),
+        suffix,
+        font=phone_font,
+        fill=(24, 134, 255),
+    )
+
+    # Tariff price.
+    d.rounded_rectangle((455, 688, 802, 756), radius=18, fill=(2, 10, 23))
+    tariff_text = f"{item.price:,} ₽ / мес".replace(",", " ")
+    tf = _template_font(43, True)
+    _draw_centered_text(d, (455, 688, 802, 756), tariff_text, tf, (255, 255, 255))
+
+    # Real tariff parameters from Bezlimit API.
+    meta = tariff_meta_for(item.phone)
+    values = [
+        ("—" if meta.get("minutes") is None else f"{int(meta['minutes']):,}".replace(",", " ")),
+        ("—" if meta.get("internet") is None else f"{int(meta['internet']):,}".replace(",", " ")),
+        ("—" if meta.get("sms") is None else f"{int(meta['sms']):,}".replace(",", " ")),
+    ]
+
+    value_boxes = [
+        (250, 795, 420, 855),
+        (570, 795, 735, 855),
+        (935, 795, 1085, 855),
+    ]
+    for box, value in zip(value_boxes, values):
+        d.rectangle(box, fill=(2, 10, 23))
+        vf = _template_font(36, True)
+        _draw_centered_text(d, box, value, vf, (250, 252, 255))
+
+    # Correct the contact footer: no fake bot/phone from the visual mock.
+    d.rounded_rectangle((82, 1030, 1172, 1162), radius=22, fill=(2, 10, 23))
+    footer1 = "ПИШИ В DIRECT / WHATSAPP"
+    footer2 = "ОФОРМЛЕНИЕ ОНЛАЙН • НОМЕР БЕСПЛАТНО"
+    f1 = _template_font(36, True)
+    f2 = _template_font(20, True)
+    _draw_centered_text(d, (100, 1042, 1155, 1104), footer1, f1, (250, 252, 255))
+    _draw_centered_text(d, (100, 1105, 1155, 1146), footer2, f2, (37, 145, 255))
+
+    if not story:
+        base.save(target, "PNG", optimize=True)
+        return
+
+    # Story keeps the exact square artwork, centered on a 9:16 dark canvas.
+    canvas = Image.new("RGB", (1080, 1920), (1, 6, 17))
+    square = base.resize((1080, 1080), Image.Resampling.LANCZOS)
+    canvas.paste(square, (0, 420))
+    canvas.save(target, "PNG", optimize=True)
+
+
 def render_selection(
 
     items: list[NumberItem],
@@ -1070,13 +1230,8 @@ def render_selection(
     subtitle: str,
     story: bool = False,
 ) -> None:
-    title_up = title.upper()
-    if "ПРЕМИУМ" in title_up:
-        render_city_single(items[0], target, premium=True, story=story)
-    elif "ОТДЕЛЬНЫЙ" in title_up:
-        render_city_single(items[0], target, premium=False, story=story)
-    elif len(items) == 1:
-        render_number_day(items[0], target, story)
+    if len(items) == 1:
+        render_exact_single_template(items[0], target, story=story)
     else:
         render_card_list(items, target, title, subtitle, story)
 
@@ -1513,22 +1668,19 @@ def _http_json(path: str, params: dict[str, object] | None = None) -> object:
         raise BezlimitApiError("API вернул некорректный JSON.") from exc
 
 
-def _convert_api_item(raw: dict) -> tuple[str, int] | None:
+def _convert_api_item(raw: dict) -> dict | None:
     try:
         phone = normalize_phone(str(raw.get("phone", "")))
         if not phone:
             return None
 
-        # Берём только свободные номера.
         if raw.get("reservation") is not None:
             return None
 
-        # API в HAR отдаёт свободные активные номера со status=2.
         status = raw.get("status")
         if status is not None and int(status) != 2:
             return None
 
-        # Нам нужны обычные бесплатные номера, где mask_price == 0.
         type_category = str(raw.get("type_category", ""))
         if type_category and type_category != "standard":
             return None
@@ -1543,18 +1695,30 @@ def _convert_api_item(raw: dict) -> tuple[str, int] | None:
         if tariff_price <= 0:
             return None
 
-        return phone, tariff_price
+        def _num(value):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "phone": phone,
+            "price": tariff_price,
+            "minutes": _num(tariff.get("minutes")),
+            "internet": _num(tariff.get("internet")),
+            "sms": _num(tariff.get("sms")),
+            "tariff_name": str(tariff.get("name") or ""),
+        }
     except (TypeError, ValueError):
         return None
 
 
-def fetch_bezlimit_catalog() -> list[tuple[str, int]]:
+def fetch_bezlimit_catalog() -> list[dict]:
     """
-    Получаем несколько случайных страниц стандартных номеров.
-    Этого достаточно, чтобы бот каждый раз выбирал свежие красивые варианты,
-    не вытягивая сотни тысяч записей.
+    Получаем случайную выборку свободных стандартных номеров.
+    Сохраняем и параметры тарифа, чтобы карточка показывала реальные данные.
     """
-    found: dict[str, int] = {}
+    found: dict[str, dict] = {}
 
     for page in range(1, BEZLIMIT_FETCH_PAGES + 1):
         payload = _http_json(
@@ -1580,15 +1744,14 @@ def fetch_bezlimit_catalog() -> list[tuple[str, int]]:
                 continue
             converted = _convert_api_item(raw)
             if converted:
-                phone, price = converted
-                found[phone] = price
+                found[converted["phone"]] = converted
 
     if not found:
         raise BezlimitApiError(
             "API ответил, но свободных стандартных номеров в выборке не найдено."
         )
 
-    return list(found.items())
+    return list(found.values())
 
 
 def _cache_is_fresh(state: dict) -> bool:
@@ -1607,26 +1770,35 @@ def _cache_is_fresh(state: dict) -> bool:
 
 def refresh_catalog_from_api(force: bool = False) -> tuple[list[tuple[str, int]], bool]:
     """
-    Returns (catalog, fetched_now).
+    Returns (simple_catalog, fetched_now).
+    Rich tariff metadata stays in state["catalog"] for rendering.
     """
     state = load_state()
 
     if not force and _cache_is_fresh(state) and state.get("catalog"):
         return get_catalog(state), False
 
-    catalog = fetch_bezlimit_catalog()
+    rows = fetch_bezlimit_catalog()
 
-    state["catalog"] = [
-        {"phone": phone, "price": price}
-        for phone, price in catalog
-    ]
+    state["catalog"] = rows
     state["api_updated_at"] = datetime.now(TZ).isoformat()
     state["api_last_error"] = None
-
-    # Не сбрасываем used при каждом API refresh: иначе одни и те же номера
-    # будут слишком часто повторяться.
     save_state(state)
-    return catalog, True
+
+    return get_catalog(state), True
+
+
+def tariff_meta_for(phone: str) -> dict:
+    state = load_state()
+    for row in state.get("catalog", []):
+        if str(row.get("phone")) == phone:
+            return {
+                "minutes": row.get("minutes"),
+                "internet": row.get("internet"),
+                "sms": row.get("sms"),
+                "tariff_name": row.get("tariff_name") or "",
+            }
+    return {}
 
 
 async def get_live_catalog(
@@ -1987,20 +2159,20 @@ def _format_auto_status(state: dict) -> str:
     return (
         "📸 АВТОПУБЛИКАЦИЯ INSTAGRAM\n\n"
         f"Статус: {'ВКЛЮЧЕНА ✅' if enabled else 'ВЫКЛЮЧЕНА ⛔️'}\n\n"
-        f"🔥 ТОП-5 — {state.get('ig_auto_top5_time', '10:00')}\n"
-        f"💰 До 1000 ₽ — {state.get('ig_auto_budget_time', '15:00')}\n"
-        f"⭐ Номер дня — {state.get('ig_auto_day_time', '19:00')}\n"
+        f"📱 Публикация 1 — {state.get('ig_auto_top5_time', '10:00')}\n"
+        f"📱 Публикация 2 — {state.get('ig_auto_budget_time', '15:00')}\n"
+        f"📱 Публикация 3 — {state.get('ig_auto_day_time', '19:00')}\n"
         "🌍 Часовой пояс — Москва\n\n"
-        "Время можно менять прямо здесь — без GitHub и Railway.\n"
-        "Номера, которые уже публиковались, повторно не выбираются."
+        "Каждый выход — ОДИН красивый номер.\n"
+        "Приоритет тарифов: 70% до 950 ₽ • 20% до 1600 ₽ • 10% дорогие."
     )
 
 
 def auto_publish_keyboard(state: dict) -> InlineKeyboardMarkup:
     enabled = bool(state.get("ig_auto_enabled"))
-    top5_time = state.get("ig_auto_top5_time", "10:00")
-    budget_time = state.get("ig_auto_budget_time", "15:00")
-    day_time = state.get("ig_auto_day_time", "19:00")
+    t1 = state.get("ig_auto_top5_time", "10:00")
+    t2 = state.get("ig_auto_budget_time", "15:00")
+    t3 = state.get("ig_auto_day_time", "19:00")
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2010,44 +2182,12 @@ def auto_publish_keyboard(state: dict) -> InlineKeyboardMarkup:
                     callback_data="igauto:toggle",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text=f"🕒 ТОП-5 — {top5_time}",
-                    callback_data="igauto:edit:top5",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"🕒 До 1000 ₽ — {budget_time}",
-                    callback_data="igauto:edit:budget",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=f"🕒 Номер дня — {day_time}",
-                    callback_data="igauto:edit:day",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧪 Тест ТОП-5",
-                    callback_data="igauto:test:top5",
-                ),
-                InlineKeyboardButton(
-                    text="🧪 Тест До 1000",
-                    callback_data="igauto:test:budget",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧪 Тест Номер дня",
-                    callback_data="igauto:test:day",
-                )
-            ],
+            [InlineKeyboardButton(text=f"🕒 Публикация 1 — {t1}", callback_data="igauto:edit:top5")],
+            [InlineKeyboardButton(text=f"🕒 Публикация 2 — {t2}", callback_data="igauto:edit:budget")],
+            [InlineKeyboardButton(text=f"🕒 Публикация 3 — {t3}", callback_data="igauto:edit:day")],
+            [InlineKeyboardButton(text="🧪 Тест публикации сейчас", callback_data="igauto:test:day")],
         ]
     )
-
-
 
 
 async def autopublish_mode(
@@ -2068,18 +2208,18 @@ async def autopublish_mode(
 
     state = load_state()
     used = set(state.get("used", []))
-    limit = 1 if mode == "day" else 5
-    items = select_mode(catalog, mode, used, limit=limit)
+    mode = "feed"
+    items = select_mode(catalog, "feed", used, limit=1)
     if not items:
         # Если всё уже использовано, очищаем только историю used для выбора
         # и повторяем на свежем каталоге. Это защита от полной остановки автопилота.
         used = set()
-        items = select_mode(catalog, mode, used, limit=limit)
+        items = select_mode(catalog, "feed", used, limit=1)
 
     if not items:
         raise RuntimeError("API не дал подходящих номеров для публикации.")
 
-    title, subtitle = MODE_META.get(mode, MODE_META["top5"])
+    title, subtitle = MODE_META["feed"]
     post, story, caption = await asyncio.to_thread(
         create_selection_bundle,
         items,
@@ -2122,7 +2262,7 @@ async def autopublish_mode(
     save_state(state)
 
     if notify:
-        kind = {"top5": "ТОП-5", "budget": "До 1000 ₽", "day": "Номер дня"}.get(mode, mode)
+        kind = "Красивый номер"
         phones = "\n".join(f"• {format_phone(x.phone)}" for x in items)
         await bot.send_message(
             chat_id,
@@ -2161,7 +2301,7 @@ async def instagram_autopilot_loop(bot: Bot) -> None:
                 and state.get("ig_auto_last_top5_date") != today
             ):
                 try:
-                    await autopublish_mode(bot, owner, "top5", notify=True)
+                    await autopublish_mode(bot, owner, "feed", notify=True)
                     state = load_state()
                     state["ig_auto_last_top5_date"] = today
                     save_state(state)
@@ -2177,7 +2317,7 @@ async def instagram_autopilot_loop(bot: Bot) -> None:
                 and state.get("ig_auto_last_budget_date") != today
             ):
                 try:
-                    await autopublish_mode(bot, owner, "budget", notify=True)
+                    await autopublish_mode(bot, owner, "feed", notify=True)
                     state = load_state()
                     state["ig_auto_last_budget_date"] = today
                     save_state(state)
@@ -2193,7 +2333,7 @@ async def instagram_autopilot_loop(bot: Bot) -> None:
                 and state.get("ig_auto_last_day_date") != today
             ):
                 try:
-                    await autopublish_mode(bot, owner, "day", notify=True)
+                    await autopublish_mode(bot, owner, "feed", notify=True)
                     state = load_state()
                     state["ig_auto_last_day_date"] = today
                     save_state(state)
@@ -2437,34 +2577,24 @@ async def instagram_stories_loop(bot: Bot) -> None:
 
 MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [
-            KeyboardButton(text="🔥 ТОП-5"),
-            KeyboardButton(text="⭐ Номер дня"),
-        ],
-        [
-            KeyboardButton(text="💰 До 1000 ₽"),
-            KeyboardButton(text="💎 Премиум"),
-        ],
-        [KeyboardButton(text="🌆 Отдельный пост")],
+        [KeyboardButton(text="📱 Красивый номер")],
+        [KeyboardButton(text="📸 Автопубликация")],
         [KeyboardButton(text="📚 Все номера по тарифам")],
         [KeyboardButton(text="🎬 Reels")],
-        [KeyboardButton(text="📸 Автопубликация")],
         [KeyboardButton(text="👀 Stories")],
         [
             KeyboardButton(text="🔄 Обновить из Безлимит"),
-            KeyboardButton(text="🤖 Автопилот"),
-        ],
-        [
             KeyboardButton(text="📊 Статус"),
-            KeyboardButton(text="🔗 Суперссылка"),
         ],
+        [KeyboardButton(text="🔗 Суперссылка")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выбери формат контента",
+    input_field_placeholder="Выбери действие",
 )
 
 
 MODE_META = {
+    "feed": ("КРАСИВЫЙ НОМЕР", "один сильный номер с приоритетом доступного тарифа"),
     "top5": ("ТОП-5 КРАСИВЫХ НОМЕРОВ", "самые запоминающиеся номера из каталога"),
     "budget": ("КРАСИВЫЕ ДО 1000 ₽", "доступные тарифы и красивые комбинации"),
     "premium": ("ПРЕМИУМ НОМЕР", "один сильный номер в эффектном городском стиле"),
@@ -2532,7 +2662,7 @@ async def send_draft(bot: Bot, chat_id: int, mode: str, rotate: bool = False) ->
     if rotate and state.get("draft"):
         used.update(str(x["phone"]) for x in state["draft"])
 
-    items = select_mode(catalog, mode, used, 5)
+    items = select_mode(catalog, mode, used, 1 if mode == "feed" else 5)
     if not items:
         await bot.send_message(chat_id, "Для этого режима подходящих номеров нет.")
         return False
@@ -2593,6 +2723,13 @@ async def start(message: Message):
         reply_markup=MENU,
     )
 
+
+
+@router.message(F.text == "📱 Красивый номер")
+async def beautiful_number_feed(message: Message, bot: Bot):
+    if await deny(message):
+        return
+    await send_draft(bot, message.chat.id, "feed")
 
 
 @router.message(F.text == "🎬 Reels")
@@ -3005,8 +3142,7 @@ async def toggle_auto(message: Message):
     txt = "ВКЛЮЧЁН ✅" if state["autopilot"] else "ВЫКЛЮЧЕН ⛔"
     await message.answer(
         f"🤖 Автопилот {txt}\n\n"
-        "Каждый день бот сам меняет формат контента: "
-        "ТОП-5, бюджетные, номер дня или премиум."
+        "Основной поток: один красивый номер с приоритетом доступных тарифов."
     )
 
 

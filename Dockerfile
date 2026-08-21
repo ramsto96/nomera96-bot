@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m playwright install --with-deps chromium
 
 COPY bot.py .
+COPY nomera96_single_template.png .
+
 RUN mkdir -p /app/data /app/output
 
 CMD ["python", "bot.py"]
